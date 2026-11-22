@@ -1,0 +1,5 @@
+{% extends "admin/change_form.html" %}
+{% block form_top %}
+<p><a href="{% url 'pixel_admin:connect_drive' %}">Connect the Pixel Google account for cover uploads</a>. Use one Drive folder per event. Save the event, then select “Sync photographs from linked Drive folders” from the event list to import its gallery.</p>
+{{ block.super }}
+{% endblock %}

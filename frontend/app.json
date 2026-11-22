@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "Pixel",
+    "slug": "pixel-mobile",
+    "owner": "kanishk_kukreja",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/pixel-logo.png",
+    "scheme": "pixelmobile",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.jatinadlak.pixel",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/pixel-logo.png",
+        "backgroundColor": "#181A1D"
+      },
+      "predictiveBackGestureEnabled": false,
+      "softwareKeyboardLayoutMode": "resize"
+    },
+    "web": {
+      "output": "server",
+      "favicon": "./assets/images/pixel-logo.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/pixel-logo.png",
+          "imageWidth": 192,
+          "resizeMode": "contain",
+          "backgroundColor": "#181A1D"
+        }
+      ],
+      "expo-secure-store",
+      "expo-video",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Choose a profile picture or publish campus media with PIXEL.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true,
+      "reactCompiler": true
+    },
+    "extra": {
+      "router": {
+        "asyncRoutes": {
+          "web": true
+        }
+      },
+      "eas": {
+        "projectId": "778807f3-c746-4875-ab9b-e353ca71bf1d"
+      }
+    }
+  }
+}

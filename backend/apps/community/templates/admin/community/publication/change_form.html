@@ -1,0 +1,5 @@
+{% extends "admin/change_form.html" %}
+{% block form_top %}
+<p><a href="{% url 'pixel_admin:connect_drive' %}">Connect the Pixel Google account for uploads</a>. Choose the Pixel account on Google's consent screen. This enables private server-side uploads and media access. Originals remain in Drive.</p>
+{{ block.super }}
+{% endblock %}

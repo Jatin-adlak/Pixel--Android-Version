@@ -1,0 +1,9 @@
+# Backend verification boundary
+
+The full suite passed **65 tests on PostgreSQL**, including real pgvector operators, typed embeddings, event-scoped result sets, HNSW schema, source-change protection and vector deletion. Authentication coverage includes exact college-domain validation, privilege rejection, verification expiry/replay, unique usernames, token rotation, logout revocation, roles, browser cookies/CSRF and mocked Google OAuth. Content/Drive tests cover persistence, ownership, visibility, moderation and synchronization. Run `python neon_manage.py test tests --noinput` from the backend environment to use a separate temporary PostgreSQL test database. See [live database verification](../../docs/live-database.md).
+
+Required cases: Student and Faculty cannot publish, change roles/staff flags, access admin or another user's private records, or bypass event visibility through nested routes/downloads/search. Anonymous requests are denied except explicitly public auth/health operations. Administrator actions succeed and are audited. Exercise list, detail, create, update, and delete routes separately.
+
+Real-provider/browser/device verification and held-out recognition accuracy remain separate from the automated suite. pgvector behavior must be tested on PostgreSQL rather than inferred from SQLite; the PostgreSQL-only test is intentionally skipped in offline SQLite runs.
+
+21 November UI/carousel update: the final offline regression run exercised 74 tests (73 passed, one PostgreSQL-only skip). All eight post-carousel tests passed on isolated PostgreSQL, including multipart ordering, active-image downloads, draft revocation, failed batch cleanup, replacement preservation/rollback and separate covers. The face-search preflight recovery ownership test also passed on PostgreSQL. See [workflow audit and phone acceptance cases](../../docs/workflow-audit.md).
