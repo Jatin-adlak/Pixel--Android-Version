@@ -46,3 +46,7 @@ private_data/
 *.log
 .DS_Store
 Thumbs.db
+
+# Local editor configuration and manual backups
+.vscode/
+/frontend/src/app/layout backupt.txt

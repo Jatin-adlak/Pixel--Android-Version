@@ -1,6 +1,6 @@
 import Modal from "../pixel/AppModal";
 import { Feather } from "@expo/vector-icons";
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Image, PanResponder, Pressable, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import BackNavigation from "../pixel/BackNavigation";
@@ -55,12 +55,35 @@ export default function PhotoViewer({
   const album = images.length > 0;
   const activeImage = images[imageIndex];
   const imageKey = `${photo.id}:${album ? imageIndex : 0}`;
+  const knownWidth = activeImage?.width || photo.image_width;
+  const knownHeight = activeImage?.height || photo.image_height;
   const ratio =
-    dimensions.key === imageKey ? dimensions.width / dimensions.height : 1;
+    dimensions.key === imageKey
+      ? dimensions.width / dimensions.height
+      : knownWidth && knownHeight
+        ? knownWidth / knownHeight
+        : 1;
   const fittedWidth = Math.min(frame.width, frame.height * ratio);
   const fittedHeight = fittedWidth / ratio;
   const coverUrl = activeImage?.cover_url || photo.cover_url;
   const previewUrl = activeImage?.preview_url || photo.preview_url;
+  // Some native load events omit source dimensions. Resolve them separately
+  // rather than depending on the event payload to size the photo.
+  useEffect(() => {
+    let active = true;
+    if (!previewUrl || (knownWidth && knownHeight)) return;
+    Image.getSize(
+      previewUrl,
+      (width, height) => {
+        if (active && width > 0 && height > 0)
+          setDimensions({ key: imageKey, width, height });
+      },
+      () => {},
+    );
+    return () => {
+      active = false;
+    };
+  }, [imageKey, previewUrl, knownWidth, knownHeight]);
   const navigation = photo.kind === "photo" || images.length > 1;
   const hasPrevious = album ? imageIndex > 0 : canPrevious;
   const hasNext = album ? imageIndex < images.length - 1 : canNext;
@@ -218,7 +241,7 @@ export default function PhotoViewer({
                 resizeMode="contain"
                 onLoad={(event) => {
                   if (ready !== imageKey) {
-                    const { width, height } = event.nativeEvent.source;
+                    const { width, height } = event.nativeEvent?.source ?? {};
                     if (width && height)
                       setDimensions({ key: imageKey, width, height });
                   }
@@ -233,7 +256,7 @@ export default function PhotoViewer({
                 resizeMode="contain"
                 onLoad={(event) => {
                   setReady(imageKey);
-                  const { width, height } = event.nativeEvent.source;
+                  const { width, height } = event.nativeEvent?.source ?? {};
                   if (width && height)
                     setDimensions({ key: imageKey, width, height });
                 }}
