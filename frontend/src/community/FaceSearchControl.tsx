@@ -23,6 +23,12 @@ type Job = {
   skipped: number;
   match_count: number;
   error: string;
+  expires_at: string;
+};
+type SearchState = {
+  available: boolean;
+  active_job: Job | null;
+  recent_job?: Job | null;
 };
 const CONSENT = "face-event-search-v1";
 
@@ -39,7 +45,7 @@ export default function FaceSearchControl({
   const [job, setJob] = useState<Job | null>(null);
   const [uploading, setUploading] = useState(false);
   const [prompt, setPrompt] = useState(false);
-  const [checking, setChecking] = useState(false);
+  const [checking, setChecking] = useState(true);
   const [error, setError] = useState("");
   const [filtered, setFiltered] = useState(false);
   const jobId = useRef<string | null>(null);
@@ -50,6 +56,8 @@ export default function FaceSearchControl({
   const [trackWidth, setTrackWidth] = useState(250);
   const processing =
     uploading || job?.status === "queued" || job?.status === "processing";
+  const activeJobId =
+    job?.status === "queued" || job?.status === "processing" ? job.id : null;
   useEffect(() => {
     onResultsRef.current = onResults;
   }, [onResults]);
@@ -58,12 +66,51 @@ export default function FaceSearchControl({
     return () => {
       mounted.current = false;
       uploadController.current?.abort();
-      if (jobId.current)
-        void api(`/face-search/${jobId.current}/`, { method: "DELETE" }).catch(
-          () => {},
-        );
     };
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<SearchState>(`/events/${eventId}/face-search/`, {
+      signal: controller.signal,
+    })
+      .then(({ active_job, recent_job }) => {
+        if (controller.signal.aborted) return;
+        const restored = active_job ?? recent_job ?? null;
+        jobId.current = restored?.id ?? null;
+        setJob(restored);
+        if (restored?.status === "failed")
+          setError(
+            restored.error || "Matching failed. Choose your photo again.",
+          );
+      })
+      .catch(() => {
+        // A failed restore must not block browsing or a later manual retry.
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setChecking(false);
+      });
+    return () => controller.abort();
+  }, [eventId]);
+  const completedId = job?.status === "complete" ? job.id : null;
+  const expiresAt = job?.expires_at;
+  useEffect(() => {
+    if (!completedId || !expiresAt) return;
+    const remaining = Date.parse(expiresAt) - Date.now();
+    const timer = setTimeout(
+      () => {
+        if (jobId.current !== completedId) return;
+        jobId.current = null;
+        setJob(null);
+        setFiltered(false);
+        onResultsRef.current(null);
+        setError(
+          "These results have expired. Choose your photo again to start a new search.",
+        );
+      },
+      Math.max(0, remaining),
+    );
+    return () => clearTimeout(timer);
+  }, [completedId, expiresAt]);
   useEffect(() => {
     if (!processing) return;
     const animation = Animated.loop(
@@ -81,15 +128,15 @@ export default function FaceSearchControl({
     };
   }, [processing, pulse]);
   useEffect(() => {
-    if (!job || !["queued", "processing"].includes(job.status)) return;
+    if (!activeJobId) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try {
-        const result = await api<Job>(`/face-search/${job.id}/`, {
+        const result = await api<Job>(`/face-search/${activeJobId}/`, {
           signal: controller.signal,
         });
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || jobId.current !== activeJobId) return;
         setError("");
         setJob(result);
         if (result.status === "complete") {
@@ -102,7 +149,7 @@ export default function FaceSearchControl({
           );
         } else timer = setTimeout(poll, 1200);
       } catch (e) {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && jobId.current === activeJobId) {
           if (e instanceof ApiError && [403, 404, 410].includes(e.status)) {
             setJob((old) => (old ? { ...old, status: "failed" } : null));
             setError("This event or search is no longer available.");
@@ -122,9 +169,7 @@ export default function FaceSearchControl({
       controller.abort();
       clearTimeout(timer);
     };
-    // Each job ID owns one polling loop; progress updates must not restart it.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.id]);
+  }, [activeJobId]);
   const choosePhoto = async () => {
     setPrompt(false);
     setError("");
@@ -134,7 +179,7 @@ export default function FaceSearchControl({
         allowsMultipleSelection: false,
         quality: 1,
       });
-      if (choice.canceled || !choice.assets[0]) return;
+      if (!mounted.current || choice.canceled || !choice.assets[0]) return;
       const asset = choice.assets[0];
       if ((asset.fileSize ?? asset.file?.size ?? 0) > 5 * 1024 * 1024) {
         setError("Choose a clear photo up to 5 MB.");
@@ -152,21 +197,16 @@ export default function FaceSearchControl({
           name: `my-photo.${asset.mimeType === "image/png" ? "png" : asset.mimeType === "image/webp" ? "webp" : "jpg"}`,
           type: asset.mimeType || "image/jpeg",
         } as unknown as Blob);
-      if (jobId.current)
-        await api(`/face-search/${jobId.current}/`, { method: "DELETE" });
       const result = await api<Job>(`/events/${eventId}/face-search/`, {
         method: "POST",
         body,
         timeoutMs: 90000,
         signal: controller.signal,
       });
-      if (!mounted.current) {
-        void api(`/face-search/${result.id}/`, { method: "DELETE" }).catch(
-          () => {},
-        );
-        return;
-      }
+      if (!mounted.current) return;
       jobId.current = result.id;
+      setFiltered(false);
+      onResultsRef.current(null);
       setJob(result);
     } catch (e) {
       if (mounted.current && !uploadController.current?.signal.aborted)
@@ -182,14 +222,25 @@ export default function FaceSearchControl({
     setChecking(true);
     setError("");
     try {
-      const state = await api<{ available: boolean; active_job: Job | null }>(
-        `/events/${eventId}/face-search/`,
-        { timeoutMs: 30000 },
-      );
+      const state = await api<SearchState>(`/events/${eventId}/face-search/`, {
+        timeoutMs: 30000,
+      });
       if (!mounted.current) return;
       if (state.active_job) {
         jobId.current = state.active_job.id;
+        setFiltered(false);
+        onResultsRef.current(null);
         setJob(state.active_job);
+        return;
+      }
+      if (
+        state.recent_job?.status === "complete" &&
+        state.recent_job.id !== jobId.current
+      ) {
+        jobId.current = state.recent_job.id;
+        setFiltered(false);
+        onResultsRef.current(null);
+        setJob(state.recent_job);
         return;
       }
       if (!state.available) {
@@ -215,6 +266,7 @@ export default function FaceSearchControl({
       setError(
         "Upload stopped. If it already reached PIXEL, tap Find yourself to resume or cancel the search.",
       );
+      return;
     }
     if (!jobId.current) return;
     try {
@@ -307,10 +359,17 @@ export default function FaceSearchControl({
             />
           </View>
           <Text style={{ color: theme.muted, fontSize: 12 }}>
-            {job?.total
-              ? `${job.processed} of ${job.total} photos checked · ${progress}%`
-              : "Please keep this event open while we prepare your matches."}
+            {uploading
+              ? "Wait for your photo to finish uploading."
+              : job?.total
+                ? `${job.processed} of ${job.total} photos checked · ${progress}%`
+                : "Preparing your matches…"}
           </Text>
+          {!uploading && (
+            <Text style={{ color: theme.muted, fontSize: 12 }}>
+              You can leave this event while PIXEL searches.
+            </Text>
+          )}
         </View>
       ) : (
         <View style={{ flexDirection: "row", alignItems: "center", gap: 14 }}>
@@ -325,9 +384,27 @@ export default function FaceSearchControl({
                 ? "Preparing face search…"
                 : filtered
                   ? "Try another photo"
-                  : "Find yourself"}
+                  : job?.status === "complete"
+                    ? "Try another photo"
+                    : "Find yourself"}
             </DesignedButton>
           </View>
+          {job?.status === "complete" && !filtered && (
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => {
+                setFiltered(true);
+                onResultsRef.current(`/face-search/${job.id}/results/`);
+              }}
+              style={{ paddingVertical: 10 }}
+            >
+              <Text
+                style={{ color: palette.blue, fontSize: 13, fontWeight: "600" }}
+              >
+                View matches
+              </Text>
+            </Pressable>
+          )}
           {filtered && (
             <Pressable
               accessibilityRole="button"

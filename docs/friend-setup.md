@@ -36,7 +36,7 @@ The second file is the Pixel Google account's Drive authorization, not a normal 
 
 Copy any intentionally shared feature settings, such as a calibrated `FACE_MATCH_THRESHOLD`, into that private file too. Do not share unrelated SMTP credentials, your Django signing secret, or your machine's worker ID. Setup also accepts a private environment-file copy for compatibility, but a minimal file is preferred.
 
-An optional service-account JSON, if used for read-only media access, goes in `backend/.local/setup/service-account.json`. It does not replace the writable Drive authorization needed for Admin uploads. Existing Drive folder IDs are in Neon; there is no need to recreate folders or copy event photos.
+A service-account key for independent media reads goes in `backend/.local/setup/service-account.json`. When configured, PIXEL uses it for previews, original downloads, video playback, gallery sync and face indexing, even when the admin's OAuth grant expires. Share the Posts, Moments, Spotlight, avatar storage and gallery folders with the service account as Viewer, including new folders that do not inherit access. Admin uploads and changes to My Drive still use the writable Google account authorization. Existing folder IDs remain in Neon.
 
 Do not include your `.venv`, `node_modules`, SQLite snapshot, face-query files, model binaries or other `.local` files. Setup generates a new Django signing secret and a **distinct face-worker ID** on the friend's first installation. Existing account passwords still work. Never manually copy a machine's worker ID to another computer.
 

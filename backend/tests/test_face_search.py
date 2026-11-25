@@ -4,6 +4,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from django.core.cache.backends.locmem import LocMemCache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import TestCase, override_settings
@@ -172,6 +173,46 @@ class FaceSearchTests(TestCase):
         self.client.force_authenticate(self.user)
         self.client.delete(f"/api/v1/face-search/{job.pk}/")
         self.assertIsNone(self.client.get(path).data["active_job"])
+
+    @patch("apps.face_search.views.worker_ready", return_value=False)
+    def test_reopening_event_recovers_completed_search_without_worker(self, ready):
+        job = self.job()
+        job.status = "complete"
+        job.save(update_fields=["status"])
+        path = f"/api/v1/events/{self.event.pk}/face-search/"
+        state = self.client.get(path).data
+        self.assertFalse(state["available"])
+        self.assertIsNone(state["active_job"])
+        self.assertEqual(state["recent_job"]["id"], str(job.pk))
+
+        self.client.force_authenticate(self.other)
+        self.assertIsNone(self.client.get(path).data["recent_job"])
+        self.client.force_authenticate(self.user)
+        with override_settings(FACE_WORKER_NODE_ID="friend-pc"):
+            self.assertIsNone(self.client.get(path).data["recent_job"])
+
+        job.expires_at = timezone.now() - timedelta(seconds=1)
+        job.save(update_fields=["expires_at"])
+        self.assertIsNone(self.client.get(path).data["recent_job"])
+
+    @patch("apps.face_search.views.worker_ready", return_value=True)
+    def test_reading_event_search_state_does_not_consume_submission_limit(self, ready):
+        from rest_framework.throttling import ScopedRateThrottle
+
+        path = f"/api/v1/events/{self.event.pk}/face-search/"
+        cache = LocMemCache("face-search-test-limit", {})
+        with (
+            patch.object(ScopedRateThrottle, "cache", cache),
+            patch.object(ScopedRateThrottle, "get_rate", return_value="1/hour"),
+        ):
+            self.assertEqual(self.client.get(path).status_code, 200)
+            self.assertEqual(self.client.get(path).status_code, 200)
+            self.assertEqual(self.client.post(path, {}, format="json").status_code, 400)
+            blocked = self.client.post(path, {}, format="json")
+            self.assertEqual(blocked.status_code, 429)
+            self.assertIn("Try again in 60 minutes", blocked.data["detail"])
+            self.assertTrue(blocked.has_header("Retry-After"))
+            self.assertEqual(self.client.get(path).status_code, 200)
 
     @patch(
         "apps.face_search.worker.download_original", side_effect=lambda p: p.drive_file_id.encode()

@@ -3,6 +3,7 @@ from django.db.models import Count, Exists, OuterRef, Q
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
 
+from apps.accounts.authentication import is_administrator
 from apps.accounts.models import User
 from apps.accounts.views import Onboarded, public_profile
 
@@ -106,7 +107,9 @@ def event_data(item, viewer=None):
         from .media import delivery_url
 
         result["cover_url"] = delivery_url(item, viewer, "thumbnail")
-    if hasattr(item, "publications"):
+    if hasattr(item, "photo_count"):
+        result["photo_count"] = item.photo_count
+    elif hasattr(item, "publications"):
         result["photo_count"] = item.publications.filter(
             kind="photo", published=True, available=True
         ).count()
@@ -118,9 +121,11 @@ def ensure_pixel(user):
         email=settings.MAIN_ADMIN_EMAIL, is_active=True, email_verified=True, role="Administrator"
     ).first()
     if pixel and pixel != user:
-        Follow.objects.update_or_create(
-            follower=user, target=pixel, defaults={"accepted": True, "mandatory": True}
-        )
+        relation = Follow.objects.filter(follower=user, target=pixel)
+        if not relation.filter(accepted=True, mandatory=True).exists():
+            relation.update_or_create(
+                follower=user, target=pixel, defaults={"accepted": True, "mandatory": True}
+            )
 
 
 class MemberView(APIView):
@@ -128,15 +133,19 @@ class MemberView(APIView):
 
 
 def comment_data(item, viewer):
+    if hasattr(item, "viewer_liked"):
+        likes, liked = item.total_likes, item.viewer_liked
+    else:
+        likes, liked = item.likes.count(), item.likes.filter(user=viewer).exists()
     return {
         "id": item.id,
         "text": item.text,
         "parent_id": item.parent_id,
         "author": identity(item.author),
         "created_at": item.created_at,
-        "like_count": item.likes.count(),
-        "liked": item.likes.filter(user=viewer).exists(),
-        "can_delete": viewer == item.author or viewer.role == "Administrator",
+        "like_count": likes,
+        "liked": liked,
+        "can_delete": viewer == item.author or is_administrator(viewer),
     }
 
 

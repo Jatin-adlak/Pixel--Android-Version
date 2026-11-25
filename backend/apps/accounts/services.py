@@ -3,16 +3,18 @@ import hashlib
 import logging
 import secrets
 from datetime import timedelta
-from urllib.parse import urlencode
+from ipaddress import ip_address
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from django.conf import settings
 from django.core.mail import send_mail
 from django.db import transaction
 from django.utils import timezone
+from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2 import id_token
-from rest_framework.exceptions import AuthenticationFailed, ValidationError
+from rest_framework.exceptions import APIException, AuthenticationFailed, ValidationError
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -29,6 +31,15 @@ from .serializers import user_data
 from .validators import college_email
 
 logger = logging.getLogger(__name__)
+GOOGLE_CLOCK_SKEW_SECONDS = 10
+
+
+class GoogleSignInUnavailable(APIException):
+    status_code = 503
+    default_detail = (
+        "PIXEL couldn’t finish signing in with Google. Return to PIXEL and try again, "
+        "or use your college email and PIXEL password."
+    )
 
 
 def digest(value):
@@ -111,6 +122,18 @@ def google_start(data):
         raise ValidationError(
             "Google sign-in is not configured yet. Use your college email and password."
         )
+    callback = urlsplit(settings.GOOGLE_REDIRECT_URI)
+    hostname = callback.hostname or ""
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        address = None
+    loopback = hostname == "localhost" or (address is not None and address.is_loopback)
+    if not loopback and (callback.scheme != "https" or address is not None or not hostname):
+        raise ValidationError(
+            "Google sign-in is unavailable at this address. Use your college email and "
+            "PIXEL password, or open PIXEL at its configured HTTPS address."
+        )
     state, nonce, verifier = (secrets.token_urlsafe(32) for _ in range(3))
     OAuthAttempt.objects.create(
         state_digest=digest(state),
@@ -139,27 +162,53 @@ def google_start(data):
 
 
 def google_claims(code, attempt):
-    with httpx.Client(timeout=10) as client:
-        response = client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code": code,
-                "client_id": settings.GOOGLE_CLIENT_ID,
-                "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                "redirect_uri": settings.GOOGLE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-                "code_verifier": attempt.provider_verifier,
-            },
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": settings.GOOGLE_CLIENT_ID,
+                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                    "code_verifier": attempt.provider_verifier,
+                },
+            )
+            response.raise_for_status()
+            raw_token = response.json().get("id_token", "")
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "Google sign-in failed during the token exchange (HTTP %s)", exc.response.status_code
         )
-        response.raise_for_status()
-        raw_token = response.json().get("id_token", "")
-    claims = id_token.verify_oauth2_token(raw_token, GoogleRequest(), settings.GOOGLE_CLIENT_ID)
-    if (
-        claims.get("nonce") != attempt.nonce
-        or claims.get("email_verified") is not True
-        or claims.get("hd") != settings.COLLEGE_DOMAIN
-    ):
-        raise AuthenticationFailed("A verified @sait.ac.in Google Workspace account is required.")
+        raise GoogleSignInUnavailable() from exc
+    except (httpx.RequestError, ValueError, AttributeError) as exc:
+        logger.warning("Google sign-in could not read the token response (%s)", type(exc).__name__)
+        raise GoogleSignInUnavailable() from exc
+    try:
+        claims = id_token.verify_oauth2_token(
+            raw_token,
+            GoogleRequest(),
+            settings.GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=GOOGLE_CLOCK_SKEW_SECONDS,
+        )
+    except (GoogleAuthError, ValueError) as exc:
+        reason = type(exc).__name__
+        if str(exc).startswith("Token used too early"):
+            reason = "clock ahead of PIXEL"
+        elif str(exc).startswith("Token expired"):
+            reason = "token expired"
+        logger.warning("Google sign-in could not validate the ID token (%s)", reason)
+        raise GoogleSignInUnavailable() from exc
+    if claims.get("nonce") != attempt.nonce:
+        raise AuthenticationFailed(
+            "Start a fresh Google sign-in from PIXEL.", code="invalid_oauth_request"
+        )
+    if claims.get("email_verified") is not True or claims.get("hd") != settings.COLLEGE_DOMAIN:
+        raise AuthenticationFailed(
+            "A verified @sait.ac.in Google Workspace account is required.",
+            code="college_identity_required",
+        )
     return claims
 
 

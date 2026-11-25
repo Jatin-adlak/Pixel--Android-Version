@@ -1,3 +1,4 @@
+import logging
 import secrets
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -8,7 +9,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Q
-from django.http import HttpResponseRedirect
+from django.http import HttpResponse, HttpResponseRedirect
 from django.middleware.csrf import CsrfViewMiddleware, get_token
 from django.utils import timezone
 from rest_framework import status
@@ -428,6 +429,19 @@ class GoogleCallbackView(PublicView):
             return self.invalid_request(request)
         try:
             claims = services.google_claims(request.query_params.get("code", ""), attempt)
+        except AuthenticationFailed as exc:
+            outcome = (
+                "invalid_oauth_request"
+                if exc.get_codes() == "invalid_oauth_request"
+                else "college_identity_required"
+            )
+            logging.getLogger(__name__).warning("Google sign-in rejected (reason=%s)", outcome)
+            return AppRedirect(redirect_uri + "?error=" + outcome)
+        except services.GoogleSignInUnavailable as exc:
+            return HttpResponse(
+                str(exc.detail), status=exc.status_code, content_type="text/plain; charset=utf-8"
+            )
+        try:
             with transaction.atomic():
                 user = services.google_user(claims)
                 services.accept_policies(
@@ -446,9 +460,13 @@ class GoogleCallbackView(PublicView):
                     client=attempt.client,
                     expires_at=timezone.now() + timedelta(minutes=2),
                 )
-        except Exception:
-            # No provider payloads, authorization codes or identity tokens in responses/logs.
-            return AppRedirect(redirect_uri + "?error=college_identity_required")
+        except AuthenticationFailed:
+            logging.getLogger(__name__).warning("Google sign-in rejected by PIXEL account policy")
+            return HttpResponse(
+                "PIXEL couldn’t sign in with this Google account. Return to PIXEL and try your account password, or contact PIXEL support.",
+                status=403,
+                content_type="text/plain; charset=utf-8",
+            )
         response = AppRedirect(redirect_uri + "?" + urlencode({"ticket": ticket}))
         response["Cache-Control"] = "no-store"
         return response

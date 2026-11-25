@@ -4,13 +4,16 @@ import json
 import os
 import secrets
 import time
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from urllib.parse import urlencode
 
 import requests
 from django.conf import settings
+from django.contrib.auth import get_user
 from django.http import HttpResponseBadRequest, HttpResponseRedirect
 
-from apps.accounts.models import User
+from apps.accounts.authentication import is_administrator
 from apps.accounts.services import challenge
 
 
@@ -44,22 +47,18 @@ def connect(request):
 
 
 def finish(request):
+    # DRF member login has its own authentication. Drive uses Django's admin session.
     attempt = request.session.pop("drive_oauth", None)
     if not attempt or not secrets.compare_digest(attempt["state"], request.GET.get("state", "")):
         return HttpResponseBadRequest("Drive authorization has expired. Start again from Admin.")
+    actor = get_user(request)
     if (
         time.time() - attempt["started"] > 600
-        or request.session.get("_auth_user_id") != attempt["actor"]
+        or not is_administrator(actor)
+        or str(actor.pk) != attempt["actor"]
     ):
         return HttpResponseBadRequest("Sign in to Admin and start Drive authorization again.")
-    actor = User.objects.filter(
-        pk=attempt["actor"],
-        is_active=True,
-        is_staff=True,
-        email_verified=True,
-        role="Administrator",
-    ).first()
-    if not actor or request.GET.get("error") or not request.GET.get("code"):
+    if request.GET.get("error") or not request.GET.get("code"):
         return HttpResponseBadRequest("Drive authorization was not completed.")
     try:
         response = requests.post(
@@ -81,20 +80,23 @@ def finish(request):
                 "Google did not issue offline access. Start authorization again."
             )
         path = settings.BASE_DIR / ".local" / "drive-oauth.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(
-                {
-                    "type": "authorized_user",
-                    "client_id": settings.GOOGLE_CLIENT_ID,
-                    "client_secret": settings.GOOGLE_CLIENT_SECRET,
-                    "refresh_token": payload["refresh_token"],
-                }
-            ),
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stream = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+        temporary = Path(stream.name)
+        try:
+            with stream:
+                json.dump(
+                    {
+                        "type": "authorized_user",
+                        "client_id": settings.GOOGLE_CLIENT_ID,
+                        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+                        "refresh_token": payload["refresh_token"],
+                    },
+                    stream,
+                )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     except (requests.RequestException, ValueError, OSError):
         return HttpResponseBadRequest("Could not complete Drive authorization. Please try again.")
     from apps.accounts.models import AuditLog

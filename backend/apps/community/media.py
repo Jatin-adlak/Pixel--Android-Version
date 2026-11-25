@@ -1,39 +1,67 @@
 """Private Drive transport. Originals never enter database columns or public storage."""
 
+import mimetypes
 import os
 import re
 
 from django.conf import settings
 from django.core import signing
-from django.http import HttpResponseRedirect, StreamingHttpResponse
+from django.http import HttpResponse, HttpResponseRedirect, StreamingHttpResponse
+from django.utils.http import content_disposition_header
+from django.utils.text import slugify
+from google.auth.exceptions import GoogleAuthError
 from google.auth.transport.requests import AuthorizedSession
-from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+from google.oauth2 import service_account
+from requests.exceptions import RequestException
+from rest_framework.exceptions import (
+    APIException,
+    NotFound,
+    PermissionDenied,
+    Throttled,
+    ValidationError,
+)
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import SimpleRateThrottle
 from rest_framework.views import APIView
 
+from apps.accounts.authentication import is_administrator
 from apps.accounts.models import User
 
 from .models import Event, ProfileImage, Publication, Spotlight
 from .views import MemberView, visible
 
 
+class MediaUnavailable(APIException):
+    status_code = 503
+    default_detail = "PIXEL can’t load this media right now. Please try again later."
+
+
 def drive_session():
     import google.auth
 
     oauth_path = settings.BASE_DIR / ".local" / "drive-oauth.json"
-    path = (
-        str(oauth_path) if oauth_path.exists() else os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "")
-    )
-    if not path:
+    if not oauth_path.is_file():
         error = APIException("Drive connection is not configured yet.")
         error.status_code = 503
         raise error
-    if not os.path.isabs(path):
-        path = str(settings.BASE_DIR / path)
     credentials, _ = google.auth.load_credentials_from_file(
-        path, scopes=["https://www.googleapis.com/auth/drive"]
+        str(oauth_path), scopes=["https://www.googleapis.com/auth/drive"]
     )
+    return AuthorizedSession(credentials)
+
+
+def drive_read_session():
+    key = os.getenv("GOOGLE_DRIVE_CREDENTIALS_FILE", "").strip()
+    if not key:
+        return drive_session()
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            str(settings.BASE_DIR / key),
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+    except (OSError, GoogleAuthError, ValueError) as exc:
+        raise MediaUnavailable() from exc
     return AuthorizedSession(credentials)
 
 
@@ -73,14 +101,24 @@ class DownloadView(MemberView):
                 raise ValidationError("Choose a valid post image.") from exc
             if item.kind != "post" or not 0 <= index < len(item.post_media):
                 raise ValidationError("This post image is unavailable.")
+        elif not (item.drive_file_id or item.original_url):
+            raise NotFound("The original file is unavailable for download.")
         return Response(
             {"url": delivery_url(item, request.user, media_index=index), "expires_in": 600}
         )
 
 
+class MediaViewerThrottle(SimpleRateThrottle):
+    scope = "media_viewer"
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {"scope": self.scope, "ident": view.media_viewer_id}
+
+
 class MediaView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
+    throttle_classes = []
 
     def get(self, request, token):
         from django.shortcuts import get_object_or_404
@@ -88,9 +126,15 @@ class MediaView(APIView):
         try:
             data = signing.loads(token, salt="pixel-media", max_age=600)
         except signing.BadSignature as exc:
-            raise PermissionDenied("This media link has expired.") from exc
+            raise PermissionDenied(
+                "This link has expired. Reopen the photo or video and try again."
+            ) from exc
+        self.media_viewer_id = data["user"]
+        throttle = MediaViewerThrottle()
+        if not throttle.allow_request(request, self):
+            raise Throttled(wait=throttle.wait())
         viewer = get_object_or_404(User, pk=data["user"], is_active=True, email_verified=True)
-        manager = viewer.role == "Administrator" and viewer.is_staff
+        manager = is_administrator(viewer)
         if "avatar" in data:
             item = get_object_or_404(
                 ProfileImage, pk=data["avatar"], user__is_active=True, user__email_verified=True
@@ -139,29 +183,30 @@ class MediaView(APIView):
             response = HttpResponseRedirect(url)
             response["Cache-Control"] = "private, no-store"
             return response
-        session = drive_session()
+        session = drive_read_session()
         if data.get("variant") in ["thumbnail", "preview"]:
-            metadata = session.get(
-                f"https://www.googleapis.com/drive/v3/files/{file_id}",
-                params={"fields": "thumbnailLink", "supportsAllDrives": "true"},
-                timeout=20,
-            )
-            thumbnail = metadata.json().get("thumbnailLink", "") if metadata.ok else ""
-            if not thumbnail:
-                session.close()
-                raise APIException("A preview is not available for this file yet.")
             from urllib.parse import urlparse
 
-            host = urlparse(thumbnail).hostname or ""
-            if not host.endswith(".googleusercontent.com"):
+            try:
+                metadata = session.get(
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                    params={"fields": "thumbnailLink", "supportsAllDrives": "true"},
+                    timeout=20,
+                )
+                thumbnail = metadata.json().get("thumbnailLink", "") if metadata.ok else ""
+                if not thumbnail:
+                    raise MediaUnavailable("A preview is not available for this file yet.")
+                host = urlparse(thumbnail).hostname or ""
+                if not host.endswith(".googleusercontent.com"):
+                    raise MediaUnavailable("This preview is unavailable. Try reopening the photo.")
+                thumbnail = re.sub(
+                    r"=s\d+", "=s1600" if data["variant"] == "preview" else "=s800", thumbnail
+                )
+                preview = session.get(thumbnail, timeout=30)
+            except (RequestException, GoogleAuthError) as exc:
+                raise MediaUnavailable() from exc
+            finally:
                 session.close()
-                raise APIException("Unexpected preview provider.")
-            thumbnail = re.sub(
-                r"=s\d+", "=s1600" if data["variant"] == "preview" else "=s800", thumbnail
-            )
-            preview = session.get(thumbnail, timeout=30)
-            session.close()
-            from django.http import HttpResponse
 
             result = HttpResponse(
                 preview.content,
@@ -173,15 +218,22 @@ class MediaView(APIView):
         headers = {}
         if request.headers.get("Range"):
             if not re.fullmatch(r"bytes=\d*-\d*", request.headers["Range"]):
-                raise ValidationError("Invalid byte range.")
+                session.close()
+                raise ValidationError(
+                    "Couldn’t start playback or resume the download. Try again from the beginning."
+                )
             headers["Range"] = request.headers["Range"]
-        response = session.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}",
-            params={"alt": "media", "supportsAllDrives": "true"},
-            headers=headers,
-            stream=True,
-            timeout=(10, 45),
-        )
+        try:
+            response = session.get(
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                params={"alt": "media", "supportsAllDrives": "true"},
+                headers=headers,
+                stream=True,
+                timeout=(10, 45),
+            )
+        except (RequestException, GoogleAuthError) as exc:
+            session.close()
+            raise MediaUnavailable() from exc
         if response.status_code not in [200, 206]:
             response.close()
             session.close()
@@ -203,5 +255,17 @@ class MediaView(APIView):
             if key in response.headers:
                 result[key] = response.headers[key]
         result["Cache-Control"] = "private, no-store"
-        result["Content-Disposition"] = "inline" if data.get("variant") == "play" else "attachment"
+        if data.get("variant") == "play":
+            result["Content-Disposition"] = "inline"
+        else:
+            name = slugify(getattr(item, "title", ""), allow_unicode=True)[:100] or "pixel-media"
+            if "media_index" in data:
+                name += f"-{data['media_index'] + 1}"
+            mime_type = result["Content-Type"].split(";", 1)[0].strip().lower()
+            extension = (
+                ".jpg" if mime_type == "image/jpeg" else mimetypes.guess_extension(mime_type)
+            )
+            result["Content-Disposition"] = content_disposition_header(
+                True, name + (extension or "")
+            )
         return result

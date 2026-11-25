@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
+from google.auth.exceptions import RefreshError
+from requests.exceptions import Timeout
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
@@ -96,7 +98,12 @@ class CommunityTests(TestCase):
         self.assertEqual(reply.status_code, 201)
         self.client.put(f"/api/v1/comments/{root['id']}/")
         self.assertEqual(Comment.objects.get(pk=root["id"]).likes.count(), 1)
+        listed = {item["id"]: item for item in self.client.get(url).data["results"]}
+        self.assertEqual(listed[root["id"]]["like_count"], 1)
+        self.assertTrue(listed[root["id"]]["liked"])
         self.client.force_authenticate(self.bob)
+        listed = {item["id"]: item for item in self.client.get(url).data["results"]}
+        self.assertFalse(listed[root["id"]]["liked"])
         self.assertEqual(self.client.delete(f"/api/v1/comments/{root['id']}/").status_code, 403)
         self.client.force_authenticate(self.admin)
         self.assertEqual(self.client.delete(f"/api/v1/comments/{root['id']}/").status_code, 204)
@@ -173,6 +180,59 @@ class CommunityTests(TestCase):
         self.post.save()
         self.assertEqual(self.client.get(path).status_code, 404)
 
+    @patch("apps.community.media.drive_read_session")
+    def test_drive_download_keeps_original_bytes_and_has_readable_filename(self, drive):
+        self.post.post_media = ["first", "second"]
+        self.post.drive_file_id = "first"
+        self.post.save(update_fields=["post_media", "drive_file_id"])
+        link = self.client.get(f"/api/v1/publications/{self.post.pk}/download/?image=1")
+        path = link.data["url"].split("8000")[1]
+        session = drive.return_value
+        upstream = session.get.return_value
+        upstream.status_code = 200
+        upstream.headers = {"Content-Type": "image/jpeg"}
+        upstream.iter_content.return_value = iter([b"original-photo"])
+
+        response = self.client.get(path)
+        self.assertEqual(response["Content-Disposition"], 'attachment; filename="final-2.jpg"')
+        self.assertEqual(b"".join(response.streaming_content), b"original-photo")
+        self.assertTrue(session.get.call_args.args[0].endswith("/second"))
+
+        session.get.side_effect = Timeout()
+        self.assertEqual(self.client.get(path).status_code, 503)
+        self.assertEqual(session.close.call_count, 2)
+
+    @patch("apps.community.media.drive_read_session")
+    def test_expired_drive_authorization_returns_safe_media_error(self, drive):
+        from urllib.parse import urlsplit
+
+        from apps.community.media import delivery_url
+
+        self.post.drive_file_id = "original"
+        self.post.save(update_fields=["drive_file_id"])
+        session = drive.return_value
+        session.get.side_effect = RefreshError("invalid_grant: Token has been expired or revoked.")
+        for variant in ("thumbnail", "preview", "original"):
+            url = delivery_url(self.post, self.alice, variant)
+            response = self.client.get(urlsplit(url).path)
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("Please try again later", str(response.data))
+            self.assertNotIn("invalid_grant", str(response.data))
+        self.assertEqual(session.close.call_count, 3)
+
+    def test_gallery_counts_only_available_published_photos(self):
+        for published, available in [(True, True), (True, False), (False, True)]:
+            Publication.objects.create(
+                kind="photo",
+                author=self.admin,
+                event=self.event,
+                title="Photo",
+                published=published,
+                available=available,
+            )
+        gallery = self.client.get("/api/v1/events/?q=campus&tag=sports")
+        self.assertEqual(gallery.data["results"][0]["photo_count"], 1)
+
     def test_partial_drive_listing_does_not_hide_photos(self):
         from apps.community.drive import sync_event
 
@@ -180,7 +240,7 @@ class CommunityTests(TestCase):
         self.post.drive_file_id = "known"
         self.post.save()
         self.event.drive_folder_id = "folder"
-        with patch("apps.community.drive.drive_session") as provider:
+        with patch("apps.community.drive.drive_read_session") as provider:
             provider.return_value.__enter__.return_value.get.side_effect = TimeoutError()
             with self.assertRaises(TimeoutError):
                 sync_event(self.event, self.admin)

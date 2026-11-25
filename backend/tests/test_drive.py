@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from django.conf import settings
+from django.core.cache.backends.locmem import LocMemCache
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
@@ -31,6 +32,37 @@ class DriveAuthorizationTests(TestCase):
     def test_connection_requires_administrator_session(self):
         url = reverse("pixel_admin:connect_drive")
         self.assertEqual(self.client.get(url).status_code, 302)
+
+    @patch("apps.community.media.drive_session")
+    @patch("apps.community.media.AuthorizedSession")
+    @patch("apps.community.media.service_account.Credentials.from_service_account_file")
+    def test_configured_reader_does_not_use_admin_oauth(self, credentials, session, writer):
+        from apps.community.media import drive_read_session
+
+        with patch.dict("os.environ", {"GOOGLE_DRIVE_CREDENTIALS_FILE": ".local/reader.json"}):
+            self.assertIs(drive_read_session(), session.return_value)
+        credentials.assert_called_once_with(
+            str(settings.BASE_DIR / ".local/reader.json"),
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+        session.assert_called_once_with(credentials.return_value)
+        writer.assert_not_called()
+
+    def test_admin_login_rejects_repeated_password_attempts(self):
+        cache = LocMemCache("admin-login-test", {})
+        with (
+            patch("apps.accounts.admin.cache", cache),
+            patch("apps.accounts.admin.time.time", return_value=3000),
+        ):
+            for _ in range(10):
+                self.client.post(
+                    "/admin/login/", {"username": self.admin.email, "password": "wrong"}
+                )
+            response = self.client.post(
+                "/admin/login/", {"username": self.admin.email, "password": "wrong"}
+            )
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers["Retry-After"], "300")
 
     def test_admin_login_preserves_same_origin_and_validates_csrf(self):
         from django.test import Client

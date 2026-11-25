@@ -27,15 +27,20 @@ class SessionJWTAuthentication(JWTAuthentication):
         return user
 
 
+def is_administrator(user):
+    return bool(
+        user
+        and user.is_authenticated
+        and user.is_active
+        and user.email_verified
+        and user.role == User.Role.ADMINISTRATOR
+        and user.is_staff
+    )
+
+
 class IsAdministrator(BasePermission):
     def has_permission(self, request, view):
-        return bool(
-            request.user
-            and request.user.is_authenticated
-            and request.user.is_active
-            and request.user.role == User.Role.ADMINISTRATOR
-            and request.user.is_staff
-        )
+        return is_administrator(request.user)
 
 
 class Onboarded(BasePermission):

@@ -1,7 +1,14 @@
+import hashlib
+import time
+
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
+from django.core.cache import cache
+from django.http import HttpResponse
+from rest_framework.throttling import BaseThrottle
 
+from .authentication import is_administrator
 from .models import (
     AuditLog,
     AuthSession,
@@ -26,13 +33,30 @@ class PixelAdminSite(admin.AdminSite):
         ] + super().get_urls()
 
     def has_permission(self, request):
-        user = request.user
-        return bool(
-            user.is_active
-            and user.is_staff
-            and user.email_verified
-            and user.role == User.Role.ADMINISTRATOR
-        )
+        return is_administrator(request.user)
+
+    def login(self, request, extra_context=None):
+        if request.method == "POST" and not self.has_permission(request):
+            window = 300
+            bucket, elapsed = divmod(int(time.time()), window)
+            address = BaseThrottle().get_ident(request)
+            identity = request.POST.get("username", "").strip().lower()[:254]
+            for kind, value, limit in (("address", address, 30), ("account", identity, 10)):
+                if not value:
+                    continue
+                digest = hashlib.sha256(value.encode()).hexdigest()
+                key = f"pixel:admin-login:{kind}:{bucket}:{digest}"
+                if not cache.add(key, 1, timeout=window + 1):
+                    if cache.incr(key) > limit:
+                        return HttpResponse(
+                            "Too many sign-in attempts. Wait a few minutes and try again.",
+                            status=429,
+                            headers={
+                                "Retry-After": str(window - elapsed),
+                                "Cache-Control": "no-store",
+                            },
+                        )
+        return super().login(request, extra_context)
 
 
 site = PixelAdminSite(name="pixel_admin")

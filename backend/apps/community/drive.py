@@ -1,8 +1,9 @@
 """Idempotent folder discovery. Reconcile deletions only after a complete listing."""
 
 from django.db import transaction
+from google.auth.exceptions import GoogleAuthError
 
-from .media import drive_session
+from .media import drive_read_session, drive_session
 from .models import Publication
 
 
@@ -65,7 +66,7 @@ def upload_media(upload, folder, kind, existing_id=None):
             )
             result.raise_for_status()
             return result.json()["id"]
-    except (requests.RequestException, KeyError) as exc:
+    except (requests.RequestException, GoogleAuthError, KeyError) as exc:
         raise RuntimeError(
             "Upload failed. Check the Google account connection and Drive folder access, then retry."
         ) from exc
@@ -76,7 +77,7 @@ def sync_event(event, author, heartbeat=None):
         raise ValueError("Set the event Drive folder ID first.")
     files = []
     token = None
-    with drive_session() as session:
+    with drive_read_session() as session:
         folder = session.get(
             f"https://www.googleapis.com/drive/v3/files/{event.drive_folder_id}",
             params={"fields": "mimeType,trashed", "supportsAllDrives": "true"},

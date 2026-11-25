@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 
 from django.conf import settings
@@ -62,26 +63,36 @@ class FaceSearchCreate(MemberView):
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "face_search"
 
+    def get_throttles(self):
+        if self.request.method == "POST":
+            return super().get_throttles()
+        return [throttle() for throttle in MemberView.throttle_classes]
+
     def get(self, request, event_id):
         get_object_or_404(Event, pk=event_id, published=True, spotlight=False)
+        latest = (
+            FaceSearchJob.objects.filter(
+                user=request.user,
+                worker_node=settings.FACE_WORKER_NODE_ID,
+                event_id=event_id,
+            )
+            .order_by("-created_at", "-pk")
+            .first()
+        )
+        active = None
+        recent = None
+        if latest and latest.expires_at > timezone.now():
+            if latest.status in {"queued", "processing"}:
+                active = job_data(latest)
+            elif latest.status in {"complete", "failed"}:
+                recent = job_data(latest)
         return Response(
             {
                 "available": worker_ready(),
                 "consent_version": CONSENT_VERSION,
                 "max_upload_bytes": MAX_QUERY_BYTES,
-                "active_job": next(
-                    (
-                        job_data(job)
-                        for job in FaceSearchJob.objects.filter(
-                            user=request.user,
-                            worker_node=settings.FACE_WORKER_NODE_ID,
-                            event_id=event_id,
-                            status__in=["queued", "processing"],
-                            expires_at__gt=timezone.now(),
-                        )[:1]
-                    ),
-                    None,
-                ),
+                "active_job": active,
+                "recent_job": recent,
             }
         )
 
@@ -126,7 +137,7 @@ class FaceSearchCreate(MemberView):
             expires_at=timezone.now() + timedelta(minutes=settings.FACE_SEARCH_TIMEOUT_MINUTES),
         )
         path = query_path(job.pk)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             with transaction.atomic():
                 FaceWorkerState.objects.select_for_update().get_or_create(node_id="__queue__")
@@ -136,11 +147,12 @@ class FaceSearchCreate(MemberView):
                     ).count()
                     >= 8
                 ):
-                    raise Throttled(
-                        wait=30, detail="Photo matching is busy. Please try again shortly."
-                    )
+                    raise Throttled(wait=30, code="face_search_busy")
                 job.save(force_insert=True)
-                path.write_bytes(data)
+                with os.fdopen(
+                    os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+                ) as query:
+                    query.write(data)
         except IntegrityError as exc:
             remove_query(job.pk)
             raise ValidationError(
@@ -171,8 +183,14 @@ class FaceSearchStatus(MemberView):
 class FaceSearchResults(MemberView):
     def get(self, request, pk):
         job = owned_job(request, pk)
+        if job.status in {"queued", "processing"}:
+            raise ValidationError(
+                "PIXEL is still looking for your photos. Check again in a moment."
+            )
         if job.status != "complete":
-            raise ValidationError("Matching has not completed, or these results have expired.")
+            raise ValidationError(
+                "These results are no longer available. Start a new search to try again."
+            )
         candidates = {
             str(photo.pk): photo
             for photo in visible(request.user).filter(

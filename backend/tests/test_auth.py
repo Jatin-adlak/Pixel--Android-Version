@@ -344,6 +344,21 @@ class AuthTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    @override_settings(
+        GOOGLE_CLIENT_ID="test-client",
+        GOOGLE_CLIENT_SECRET="test-secret",
+        GOOGLE_REDIRECT_URI="http://192.168.1.69:8001/api/v1/auth/google/callback/",
+    )
+    def test_google_sign_in_rejects_lan_callback_before_creating_attempt(self):
+        response = self.client.post(
+            "/api/v1/auth/google/start/",
+            {**self.policy, "client": "web", "challenge": challenge("a" * 64)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Use your college email", str(response.data))
+        self.assertFalse(OAuthAttempt.objects.exists())
+
     @override_settings(GOOGLE_CLIENT_ID="test-client", GOOGLE_CLIENT_SECRET="test-secret")
     def test_google_state_pkce_nonce_and_one_time_exchange(self):
         verifier = "a" * 64
@@ -388,6 +403,79 @@ class AuthTests(TestCase):
         self.assertEqual(
             self.client.post("/api/v1/auth/google/exchange/", data, format="json").status_code, 401
         )
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client", GOOGLE_CLIENT_SECRET="test-secret")
+    def test_google_provider_failure_does_not_blame_verified_account(self):
+        import httpx
+
+        from apps.accounts.models import OAuthTicket
+
+        started = self.client.post(
+            "/api/v1/auth/google/start/",
+            {**self.policy, "client": "web", "challenge": challenge("a" * 64)},
+            format="json",
+        )
+        state = parse_qs(urlparse(started.data["url"]).query)["state"][0]
+        upstream = httpx.Response(
+            401,
+            json={"error_description": "provider-only details"},
+            request=httpx.Request("POST", "https://oauth2.googleapis.com/token"),
+        )
+        with patch("apps.accounts.services.httpx.Client") as provider:
+            provider.return_value.__enter__.return_value.post.return_value = upstream
+            response = self.client.get(
+                "/api/v1/auth/google/callback/", {"state": state, "code": "test-code"}
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertNotContains(response, "provider-only details", status_code=503)
+        self.assertContains(response, "try again", status_code=503)
+        self.assertFalse(OAuthTicket.objects.exists())
+
+    @override_settings(GOOGLE_CLIENT_ID="test-client")
+    def test_google_token_validation_allows_small_clock_difference(self):
+        import json
+        from unittest.mock import Mock
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from google.auth import crypt, jwt
+
+        from apps.accounts.services import GoogleSignInUnavailable, google_claims
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        signer = crypt.RSASigner(key, key_id="test-key")
+        public_key = (
+            key.public_key()
+            .public_bytes(
+                serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            .decode()
+        )
+        google_certs = Mock(
+            return_value=Mock(status=200, data=json.dumps({"test-key": public_key}).encode())
+        )
+        attempt = OAuthAttempt(nonce="expected", provider_verifier="value")
+        now = int(timezone.now().timestamp())
+        claims = {
+            "iss": "https://accounts.google.com",
+            "aud": "test-client",
+            "iat": now + 5,
+            "exp": now + 3600,
+            "nonce": attempt.nonce,
+            "email_verified": True,
+            "hd": settings.COLLEGE_DOMAIN,
+        }
+        with (
+            patch("apps.accounts.services.GoogleRequest", return_value=google_certs),
+            patch("apps.accounts.services.httpx.Client") as provider,
+        ):
+            exchange = provider.return_value.__enter__.return_value.post.return_value
+            exchange.json.return_value = {"id_token": jwt.encode(signer, claims).decode()}
+            self.assertEqual(google_claims("test-code", attempt), claims)
+            for rejected in ({**claims, "iat": now + 60}, {**claims, "aud": "other-client"}):
+                exchange.json.return_value = {"id_token": jwt.encode(signer, rejected).decode()}
+                with self.assertRaises(GoogleSignInUnavailable):
+                    google_claims("test-code", attempt)
 
     def test_google_verifier_rejects_domain_and_unverified_claims(self):
         from rest_framework.exceptions import AuthenticationFailed

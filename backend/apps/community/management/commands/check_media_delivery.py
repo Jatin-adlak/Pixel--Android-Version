@@ -8,7 +8,7 @@ from django.core.management.base import BaseCommand, CommandError
 from rest_framework.test import APIClient
 
 from apps.accounts.models import User
-from apps.community.media import drive_session
+from apps.community.media import drive_read_session
 from apps.community.models import EventSyncState, Publication
 
 
@@ -30,7 +30,7 @@ class Command(BaseCommand):
             raise CommandError(
                 "A published gallery photograph and Pixel administrator are required."
             )
-        with drive_session() as session:
+        with drive_read_session() as session:
             metadata = session.get(
                 f"https://www.googleapis.com/drive/v3/files/{photo.drive_file_id}",
                 params={"fields": "size,md5Checksum", "supportsAllDrives": "true"},

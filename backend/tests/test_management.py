@@ -55,6 +55,20 @@ class ManagementTests(TestCase):
             self.client.post("/api/v1/management/events/", {}, format="json").status_code, 403
         )
 
+    def test_administrator_requires_active_verified_staff_account(self):
+        url = "/api/v1/management/dashboard/"
+        self.assertEqual(self.client.get(url).status_code, 200)
+        for flag in ("email_verified", "is_staff", "is_active"):
+            setattr(self.admin, flag, False)
+            self.assertEqual(self.client.get(url).status_code, 403)
+            setattr(self.admin, flag, True)
+
+    def test_role_without_staff_cannot_moderate_another_members_comment(self):
+        comment = Comment.objects.create(publication=self.photo, author=self.member, text="Hello")
+        self.admin.is_staff = False
+        self.assertEqual(self.client.delete(f"/api/v1/comments/{comment.pk}/").status_code, 403)
+        self.assertTrue(Comment.objects.filter(pk=comment.pk).exists())
+
     def test_comment_groups_and_content_search_are_scoped_and_paginated(self):
         other = Publication.objects.create(
             kind="post",
@@ -276,7 +290,7 @@ class ManagementTests(TestCase):
             published=True,
         )
         Reaction.objects.create(user=self.member, publication=self.photo, action="save")
-        with patch("apps.community.drive.drive_session") as provider:
+        with patch("apps.community.drive.drive_read_session") as provider:
             response = Mock()
             response.json.return_value = {
                 "files": [

@@ -1,6 +1,9 @@
+from django.db.models import Count, Exists, OuterRef, Q
 from django.shortcuts import get_object_or_404
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
+
+from apps.accounts.authentication import is_administrator
 
 from .models import Comment, CommentLike, Event, Reaction
 from .queries import MemberView, comment_data, content, ensure_pixel, event_data, page, visible
@@ -31,6 +34,16 @@ class EventsView(MemberView):
             items = items.filter(title__icontains=request.query_params["q"][:160])
         if request.query_params.get("tag"):
             items = items.filter(tag__iexact=request.query_params["tag"][:40])
+        items = items.annotate(
+            photo_count=Count(
+                "publications",
+                filter=Q(
+                    publications__kind="photo",
+                    publications__published=True,
+                    publications__available=True,
+                ),
+            )
+        )
         return page(request, items, lambda item: event_data(item, request.user))
 
 
@@ -65,9 +78,17 @@ class ReactionView(MemberView):
 class CommentsView(MemberView):
     def get(self, request, pk):
         item = get_object_or_404(visible(request.user), pk=pk)
-        return page(
-            request, item.comments.select_related("author"), lambda c: comment_data(c, request.user)
+        comments = (
+            item.comments.select_related("author", "author__profile_image")
+            .annotate(
+                total_likes=Count("likes"),
+                viewer_liked=Exists(
+                    CommentLike.objects.filter(comment_id=OuterRef("pk"), user=request.user)
+                ),
+            )
+            .order_by("created_at", "id")
         )
+        return page(request, comments, lambda c: comment_data(c, request.user))
 
     def post(self, request, pk):
         item = get_object_or_404(visible(request.user), pk=pk)
@@ -91,7 +112,7 @@ class CommentsView(MemberView):
 class CommentView(MemberView):
     def delete(self, request, pk):
         item = get_object_or_404(Comment, pk=pk, publication__in=visible())
-        if item.author != request.user and request.user.role != "Administrator":
+        if item.author != request.user and not is_administrator(request.user):
             raise PermissionDenied()
         item.delete()
         return Response(status=204)

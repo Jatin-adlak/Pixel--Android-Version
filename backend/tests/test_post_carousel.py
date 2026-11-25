@@ -17,7 +17,7 @@ from apps.community.models import DriveFolder, Event, Publication, Reaction
 
 
 class PostCarouselTests(TestCase):
-    @patch("apps.community.management.commands.backfill_post_dimensions.drive_session")
+    @patch("apps.community.management.commands.backfill_post_dimensions.drive_read_session")
     def test_older_posts_get_dimensions_without_changing_originals_or_saves(self, session):
         post = Publication.objects.create(
             author=self.admin,

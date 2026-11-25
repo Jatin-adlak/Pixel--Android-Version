@@ -2,6 +2,7 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import dj_database_url
 from dotenv import load_dotenv
@@ -37,7 +38,9 @@ INSTALLED_APPS = [
 ]
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
+    "config.middleware.private_api_responses",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -69,7 +72,11 @@ if database_url:
     DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
     DATABASES["default"].setdefault("OPTIONS", {})["connect_timeout"] = 15
     if ".neon.tech" in DATABASES["default"].get("HOST", ""):
-        DATABASES["default"]["OPTIONS"]["sslmode"] = "require"
+        DATABASES["default"]["OPTIONS"].setdefault("sslmode", "require")
+    if not DEBUG:
+        options = DATABASES["default"]["OPTIONS"]
+        if options.setdefault("sslmode", "require") not in {"require", "verify-ca", "verify-full"}:
+            raise RuntimeError("Production requires a TLS connection to PostgreSQL.")
 elif DEBUG:
     DATABASES = {
         "default": {
@@ -96,6 +103,10 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+}
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 COLLEGE_DOMAIN = "sait.ac.in"
 PRIVACY_VERSION = "2026-11-17"
@@ -114,10 +125,21 @@ CSRF_COOKIE_SECURE = not DEBUG
 REFRESH_COOKIE_SECURE = not DEBUG
 SECURE_SSL_REDIRECT = not DEBUG
 SECURE_HSTS_SECONDS = 0 if DEBUG else 31536000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.getenv("DJANGO_HSTS_INCLUDE_SUBDOMAINS") == "true"
+SECURE_HSTS_PRELOAD = os.getenv("DJANGO_HSTS_PRELOAD") == "true"
+if not DEBUG and os.getenv("DJANGO_TRUST_HTTPS_PROXY") == "true":
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = "same-origin"
 X_FRAME_OPTIONS = "DENY"
 DATA_UPLOAD_MAX_MEMORY_SIZE = 64 * 1024
+cache_url = os.getenv("PIXEL_CACHE_URL", "")
+if cache_url:
+    if urlsplit(cache_url).scheme not in {"redis", "rediss"}:
+        raise RuntimeError("PIXEL_CACHE_URL must be a Redis URL.")
+    CACHES = {
+        "default": {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": cache_url}
+    }
 EMAIL_BACKEND = os.getenv(
     "EMAIL_BACKEND",
     "django.core.mail.backends.filebased.EmailBackend"
@@ -140,6 +162,8 @@ OAUTH_APP_REDIRECTS = {
     "native": "pixelmobile://auth/callback",
 }
 REST_FRAMEWORK = {
+    "NUM_PROXIES": int(os.getenv("DJANGO_TRUSTED_PROXY_COUNT", "0")),
+    "EXCEPTION_HANDLER": "config.api_errors.user_facing_exception_handler",
     "DEFAULT_AUTHENTICATION_CLASSES": ["apps.accounts.authentication.SessionJWTAuthentication"],
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.IsAuthenticated"],
     "DEFAULT_THROTTLE_CLASSES": [
@@ -149,6 +173,7 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "3000/hour",
         "user": "3000/hour",
+        "media_viewer": "300/minute",
         "auth": "600/minute",
         "email": "60/minute",
         "credential": "10/minute",
@@ -173,5 +198,32 @@ LOGGING = {
     "handlers": {"console": {"class": "logging.StreamHandler", "filters": ["redact_oauth"]}},
     "loggers": {"django.server": {"handlers": ["console"], "level": "INFO", "propagate": False}},
 }
-if not DEBUG and (len(SECRET_KEY) < 50 or not EMAIL_HOST):
-    raise RuntimeError("Production requires a strong secret and configured email delivery.")
+if not DEBUG:
+    if (
+        len(SECRET_KEY) < 50
+        or len(set(SECRET_KEY)) < 5
+        or SECRET_KEY.startswith("django-insecure-")
+    ):
+        raise RuntimeError("Production requires a strong random Django secret.")
+    if (
+        not EMAIL_HOST
+        or EMAIL_BACKEND != "django.core.mail.backends.smtp.EmailBackend"
+        or not EMAIL_USE_TLS
+    ):
+        raise RuntimeError("Production requires SMTP email delivery over TLS.")
+    if not cache_url:
+        raise RuntimeError("Production requires a shared Redis cache for rate limits.")
+    if not ALLOWED_HOSTS or any(not host or host.startswith((".", "*")) for host in ALLOWED_HOSTS):
+        raise RuntimeError("Production requires explicit allowed hostnames.")
+    for origin in (FRONTEND_URL, BACKEND_URL, *CORS_ALLOWED_ORIGINS):
+        parts = urlsplit(origin)
+        if (
+            parts.scheme != "https"
+            or not parts.hostname
+            or parts.username
+            or parts.password
+            or parts.path
+            or parts.query
+            or parts.fragment
+        ):
+            raise RuntimeError("Production requires explicit HTTPS origins.")

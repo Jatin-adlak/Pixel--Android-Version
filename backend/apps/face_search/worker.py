@@ -12,7 +12,7 @@ from face_recognition.app.engine import (
     get_engine,
 )
 
-from apps.community.media import drive_session
+from apps.community.media import drive_read_session
 from apps.community.models import Publication
 
 from .models import FaceSearchJob, PhotoFaceIndex
@@ -23,7 +23,7 @@ from .vectors import exact_scores, replace_embeddings
 def download_original(photo):
     if not photo.drive_file_id:
         raise ValueError("Only connected Drive photographs can be indexed.")
-    with drive_session() as session:
+    with drive_read_session() as session:
         with session.get(
             f"https://www.googleapis.com/drive/v3/files/{photo.drive_file_id}",
             params={"alt": "media", "supportsAllDrives": "true"},

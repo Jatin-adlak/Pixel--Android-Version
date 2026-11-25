@@ -3,7 +3,7 @@
 import requests
 from django.core.management.base import BaseCommand
 
-from apps.community.media import drive_session
+from apps.community.media import drive_read_session
 from apps.community.models import Publication
 
 
@@ -13,7 +13,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         changed = skipped = 0
         cached = {}
-        with drive_session() as session:
+        with drive_read_session() as session:
             for post in (
                 Publication.objects.filter(kind="post")
                 .exclude(drive_file_id="")

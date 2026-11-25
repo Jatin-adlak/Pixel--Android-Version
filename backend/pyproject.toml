@@ -15,8 +15,11 @@ dependencies = [
   "httpx>=0.28,<1",
   "opencv-python-headless>=4.12,<5",
   "numpy>=2,<3",
-  "pillow>=11,<13",
+  "pillow>=13,<14",
   "pgvector>=0.4,<0.5",
+  "redis>=6,<8",
+  "gunicorn>=23,<27",
+  "whitenoise>=6.9,<7",
 ]
 
 [dependency-groups]
