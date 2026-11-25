@@ -71,6 +71,8 @@ export function Field({
   multiline = false,
   placeholder = "",
   keyboardType = "default",
+  secure = false,
+  search = false,
 }: {
   label: string;
   value: string;
@@ -78,6 +80,8 @@ export function Field({
   multiline?: boolean;
   placeholder?: string;
   keyboardType?: "default" | "url" | "numeric";
+  secure?: boolean;
+  search?: boolean;
 }) {
   const t = useAdminTheme();
   return (
@@ -93,7 +97,12 @@ export function Field({
         placeholderTextColor={t.muted}
         multiline={multiline}
         keyboardType={keyboardType}
+        inputMode={search ? "search" : undefined}
         autoCapitalize="none"
+        secureTextEntry={secure}
+        autoCorrect={secure || search ? false : undefined}
+        autoComplete={secure ? "new-password" : search ? "off" : undefined}
+        maxLength={secure ? 128 : undefined}
         style={[
           u.field,
           {

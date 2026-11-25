@@ -46,6 +46,8 @@ export type AdminMember = {
   role: string;
   is_active: boolean;
   email_verified: boolean;
+  has_password: boolean;
+  can_set_password: boolean;
   department: string;
   year: string;
 };

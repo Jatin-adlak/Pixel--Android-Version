@@ -20,6 +20,7 @@ import LoadingImage from "../pixel/loading/LoadingImage";
 import LiquidPage from "../pixel/LiquidPage";
 import RefreshScrollView from "../pixel/RefreshScrollView";
 import EventEditor from "./EventEditor";
+import MemberPasswordDialog from "./MemberPasswordDialog";
 import Overview from "./Overview";
 import CommentModeration from "./CommentModeration";
 import PublicationEditor from "./PublicationEditor";
@@ -70,6 +71,9 @@ export default function AdminWorkspace({
   const [eventChoices, setEventChoices] = useState<AdminEvent[]>([]);
   const [publications, setPublications] = useState<AdminPublication[]>([]);
   const [members, setMembers] = useState<AdminMember[]>([]);
+  const [passwordMember, setPasswordMember] = useState<AdminMember | null>(
+    null,
+  );
   const [commentRevision, setCommentRevision] = useState(0);
   const [storage, setStorage] = useState<Storage | null>(null);
   const [postFolder, setPostFolder] = useState(""),
@@ -709,6 +713,7 @@ export default function AdminWorkspace({
                         value={query}
                         onChange={setQuery}
                         placeholder="Username, name or college email"
+                        search
                       />
                       {members.map((member) => (
                         <Panel key={member.id}>
@@ -765,6 +770,17 @@ export default function AdminWorkspace({
                               : "Not verified"}
                           </Copy>
                           <View style={u.row}>
+                            {member.can_set_password && (
+                              <Button
+                                compact
+                                secondary
+                                onPress={() => setPasswordMember(member)}
+                              >
+                                {member.has_password
+                                  ? "Change password"
+                                  : "Set password"}
+                              </Button>
+                            )}
                             {["Student", "Faculty", "Administrator"].map(
                               (role) => (
                                 <Chip
@@ -954,6 +970,23 @@ export default function AdminWorkspace({
             </RefreshScrollView>
           </View>
 
+          {passwordMember && (
+            <MemberPasswordDialog
+              key={passwordMember.id}
+              member={passwordMember}
+              close={() => setPasswordMember(null)}
+              onSaved={(updated) => {
+                setMembers((old) =>
+                  old.map((member) =>
+                    member.id === updated.id ? updated : member,
+                  ),
+                );
+                setPasswordMember(null);
+                setError("");
+                setMessage("Password saved. The member must sign in again.");
+              }}
+            />
+          )}
           {confirm && (
             <Modal
               visible

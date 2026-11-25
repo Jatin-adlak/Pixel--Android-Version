@@ -7,7 +7,8 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from rest_framework.test import APIClient
 
-from apps.accounts.models import User
+from apps.accounts.models import AuditLog, AuthSession, User
+from apps.accounts.services import create_session
 from apps.community.models import Comment, Event, EventSyncState, Publication, Reaction
 from apps.community.synchronization import synchronize
 
@@ -62,6 +63,90 @@ class ManagementTests(TestCase):
             setattr(self.admin, flag, False)
             self.assertEqual(self.client.get(url).status_code, 403)
             setattr(self.admin, flag, True)
+
+    def test_admin_can_set_and_replace_password_and_revoke_sessions(self):
+        self.member.set_unusable_password()
+        self.member.save(update_fields=["password"])
+        url = f"/api/v1/management/members/{self.member.pk}/password/"
+        self.assertFalse(self.client.get(url.removesuffix("password/")).data["has_password"])
+        for password in ("River-canvas-lantern-62", "Silver-violet-penguin-87"):
+            session = create_session(self.member, "native").data
+            other_client = APIClient()
+            self.assertEqual(
+                other_client.get(
+                    "/api/v1/me/", HTTP_AUTHORIZATION=f"Bearer {session['access']}"
+                ).status_code,
+                200,
+            )
+            result = self.client.put(url, {"password": password}, format="json")
+            self.assertEqual(result.status_code, 200)
+            self.assertTrue(result.data["has_password"])
+            self.assertNotIn("password", result.data)
+            self.assertNotIn(password, str(result.data))
+            self.member.refresh_from_db()
+            self.assertTrue(self.member.check_password(password))
+            self.assertFalse(AuthSession.objects.filter(user=self.member, revoked=False).exists())
+            self.assertEqual(
+                other_client.get(
+                    "/api/v1/me/", HTTP_AUTHORIZATION=f"Bearer {session['access']}"
+                ).status_code,
+                401,
+            )
+            self.assertEqual(
+                other_client.post(
+                    "/api/v1/auth/refresh/",
+                    {"client": "native", "refresh": session["refresh"]},
+                    format="json",
+                ).status_code,
+                401,
+            )
+        self.assertEqual(
+            AuditLog.objects.filter(
+                actor=self.admin, action=f"member_password_set:{self.member.pk}"
+            ).count(),
+            2,
+        )
+
+    def test_password_requires_admin_and_leaves_verification_unchanged(self):
+        url = f"/api/v1/management/members/{self.member.pk}/password/"
+        password = {"password": "River-canvas-lantern-62"}
+        self.client.force_authenticate(self.member)
+        self.assertEqual(self.client.put(url, password, format="json").status_code, 403)
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(
+            self.client.put(url, {"password": "123456789012"}, format="json").status_code, 400
+        )
+        self.member.email_verified = False
+        self.member.save(update_fields=["email_verified"])
+        self.assertEqual(self.client.put(url, password, format="json").status_code, 200)
+        self.member.refresh_from_db()
+        self.assertFalse(self.member.email_verified)
+
+    def test_peer_admin_cannot_change_owner_or_other_admin_password(self):
+        peer = User.objects.create_superuser("peer@sait.ac.in", "test", username="peer")
+        other = User.objects.create_superuser("other@sait.ac.in", "test", username="other")
+        self.client.force_authenticate(peer)
+        for member in (self.admin, other):
+            url = f"/api/v1/management/members/{member.pk}/"
+            self.assertFalse(self.client.get(url).data["can_set_password"])
+            self.assertEqual(
+                self.client.put(
+                    url + "password/", {"password": "River-canvas-lantern-62"}, format="json"
+                ).status_code,
+                403,
+            )
+            self.assertEqual(
+                self.client.patch(url, {"role": "Student"}, format="json").status_code, 403
+            )
+        self.client.force_authenticate(self.admin)
+        self.assertEqual(
+            self.client.put(
+                f"/api/v1/management/members/{other.pk}/password/",
+                {"password": "River-canvas-lantern-62"},
+                format="json",
+            ).status_code,
+            200,
+        )
 
     def test_role_without_staff_cannot_moderate_another_members_comment(self):
         comment = Comment.objects.create(publication=self.photo, author=self.member, text="Hello")

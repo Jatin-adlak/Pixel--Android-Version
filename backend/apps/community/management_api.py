@@ -3,17 +3,19 @@
 import re
 
 from django.conf import settings
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Count, Max, Q
 from django.utils import timezone
 from rest_framework import serializers, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.authentication import IsAdministrator
-from apps.accounts.models import AuditLog, User
+from apps.accounts.models import AuditLog, AuthSession, User
 
 from .drive import change_drive_file, upload_media
 from .media import delivery_url, drive_session
@@ -539,7 +541,34 @@ class GalleryUploadView(APIView):
         return Response({"uploaded": count, "failed": failed}, status=201)
 
 
+def can_manage_password(actor, member):
+    return (
+        actor.pk == member.pk
+        or actor.email == settings.MAIN_ADMIN_EMAIL
+        or (member.role != User.Role.ADMINISTRATOR and member.email != settings.MAIN_ADMIN_EMAIL)
+    )
+
+
+class MemberPasswordSerializer(serializers.Serializer):
+    password = serializers.CharField(
+        min_length=12, max_length=128, trim_whitespace=False, write_only=True
+    )
+
+    def validate_password(self, value):
+        try:
+            validate_password(value, self.context["member"])
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(exc.messages) from exc
+        return value
+
+
 class MemberSerializer(StrictModelSerializer):
+    has_password = serializers.BooleanField(source="has_usable_password", read_only=True)
+    can_set_password = serializers.SerializerMethodField()
+
+    def get_can_set_password(self, member):
+        return can_manage_password(self.context["request"].user, member)
+
     class Meta:
         model = User
         fields = [
@@ -552,6 +581,8 @@ class MemberSerializer(StrictModelSerializer):
             "email_verified",
             "department",
             "year",
+            "has_password",
+            "can_set_password",
         ]
         read_only_fields = [
             "id",
@@ -591,6 +622,8 @@ class MembersViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         items = super().get_queryset()
+        if self.action in {"partial_update", "set_password"}:
+            items = items.select_for_update()
         query = self.request.query_params.get("q", "")[:80]
         return (
             items.filter(
@@ -602,12 +635,34 @@ class MembersViewSet(viewsets.ReadOnlyModelViewSet):
             else items
         )
 
+    @transaction.atomic
     def partial_update(self, request, *args, **kwargs):
-        serializer = self.get_serializer(self.get_object(), data=request.data, partial=True)
+        member = self.get_object()
+        if not can_manage_password(request.user, member):
+            raise PermissionDenied(
+                "Only the PIXEL owner can change another administrator’s access."
+            )
+        serializer = self.get_serializer(member, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         AuditLog.objects.create(actor=request.user, action="member_access_updated")
         return Response(serializer.data)
+
+    @action(detail=True, methods=["put"], url_path="password")
+    @transaction.atomic
+    def set_password(self, request, *args, **kwargs):
+        member = self.get_object()
+        if not can_manage_password(request.user, member):
+            raise PermissionDenied(
+                "Only the PIXEL owner can change another administrator’s password."
+            )
+        serializer = MemberPasswordSerializer(data=request.data, context={"member": member})
+        serializer.is_valid(raise_exception=True)
+        member.set_password(serializer.validated_data["password"])
+        member.save(update_fields=["password"])
+        AuthSession.objects.filter(user=member, revoked=False).update(revoked=True)
+        AuditLog.objects.create(actor=request.user, action=f"member_password_set:{member.pk}")
+        return Response(self.get_serializer(member).data)
 
 
 class ModerationSerializer(serializers.ModelSerializer):
